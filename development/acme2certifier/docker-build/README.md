@@ -77,7 +77,7 @@ TSA_NAME="Maringa TSA"
 IMAGE_NAME="maringa-dev"
 IMAGE_TAG="1.0.0"
 AWS_REGION="sa-east-1"
-ECR_ACCOUNT_ID="644266601430"
+ECR_ACCOUNT_ID="644222222" "Informe a conta correta"
 ```
 
 O `CA_NAME` é o CN que aparecerá no certificado e no Central Server X-Road.
@@ -138,7 +138,7 @@ Após o push ECR, atualizar `k8s-acme/kustomization.yaml`:
 ```yaml
 images:
   - name: testca-dev
-    newName: 644266601430.dkr.ecr.sa-east-1.amazonaws.com/maringa-dev
+    newName: 6442222222.dkr.ecr.sa-east-1.amazonaws.com/maringa-dev
     newTag: "1.0.0"
 ```
 
