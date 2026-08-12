@@ -1,0 +1,58 @@
+
+```bash
+# 4.1. Verificar pods Velero
+kubectl get pods -n velero
+# Esperado: velero-XXXX (Running) + node-agent-XXXX em cada node
+
+# 4.2. Verificar BackupStorageLocation
+kubectl get backupstoragelocation -n velero
+# Esperado: STATUS = Available
+
+# 4.3. Verificar VolumeSnapshotLocation
+kubectl get volumesnapshotlocation -n velero
+
+# 4.4. Verificar conectividade S3 (via logs)
+kubectl logs -n velero -l app.kubernetes.io/name=velero --tail=20
+
+# 4.5. Instalar CLI do Velero (se não tiver)
+brew install velero
+
+# 4.6. Verificar status geral
+velero version
+velero backup-location get
+velero snapshot-location get
+```
+
+### Fase 5 — Teste de Backup Seguro (sem impacto)
+
+```bash
+# 5.1. Backup de um namespace pequeno/não-crítico primeiro
+velero backup create test-xvia-ss \
+  --include-namespaces xvia-ss \
+  --wait
+
+# 5.2. Verificar se completou
+velero backup describe test-xvia-ss
+velero backup logs test-xvia-ss
+
+# 5.3. Teste de restore em namespace DIFERENTE (sem afetar produção!)
+velero restore create test-restore-xvia-ss \
+  --from-backup test-xvia-ss \
+  --namespace-mappings xvia-ss:xvia-ss-restore-test \
+  --wait
+
+# 5.4. Verificar o restore
+kubectl get all -n xvia-ss-restore-test
+
+# 5.5. Limpar namespace de teste
+kubectl delete namespace xvia-ss-restore-test
+
+# Deletar backup antigo
+velero backup delete test-xvia-ss --confirm
+
+# 5.6. Se tudo OK, testar backup com volumes (plataforma-gov-dev)
+velero backup create test-plataforma-volumes \
+  --include-namespaces plataforma-gov-dev \
+  --default-volumes-to-fs-backup=true \
+  --wait
+

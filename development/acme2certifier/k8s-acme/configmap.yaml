@@ -1,0 +1,100 @@
+# =============================================================================
+# configmap.yaml — Configurações do testca-dev
+#
+# Inclui:
+#   - acme_srv.cfg        → configuração do acme2certifier
+#   - kid_profiles.json   → perfis EAB (auth/sign) com HMACs
+#
+# NOTA: o openssl_ca_handler.py é copiado via initContainer a partir da imagem
+#       (já está em /var/www/acme2certifier/examples/ca_handler/ na imagem base)
+#       Caso queira sobrescrever, descomente a seção handler no deployment.yaml
+#
+# ⚠️  SEGURANÇA: Os HMACs abaixo são de DEV/teste. Em produção, gere novos com:
+#       openssl rand -hex 32
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: testca-config
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: config
+data:
+  # ---------------------------------------------------------------------------
+  # acme_srv.cfg — Configuração principal do acme2certifier
+  # Caminhos são internos ao container: /home/ca/CA/ (montado em PVC)
+  # ---------------------------------------------------------------------------
+  acme_srv.cfg: |
+    [DEFAULT]
+    debug: False
+
+    [Nonce]
+    # Desabilitar nonce check APENAS para teste/debug
+    nonce_check_disable: False
+
+    [CAhandler]
+    handler_file: examples/ca_handler/openssl_ca_handler.py
+    issuing_ca_key: /home/ca/CA/private/ca.key.pem
+    issuing_ca_cert: /home/ca/CA/certs/ca.cert.pem
+    issuing_ca_crl: /home/ca/CA/crl/ca.crl.pem
+    cert_validity_days: 30
+    cert_save_path: /home/ca/CA/newcerts
+    ca_cert_chain_list: ["/home/ca/CA/certs/ca.cert.pem"]
+    openssl_conf: /home/ca/CA/CA.cnf
+    cert_db_index_file: /home/ca/CA/index.txt
+    cert_serial_file: /home/ca/CA/serial
+    save_cert_as_hex: True
+    # eab_profiling desabilitado: X-Road 7.8 (acme4j) não suporta
+    eab_profiling: False
+
+    [EABhandler]
+    eab_handler_file: examples/eab_handler/kid_profile_handler.py
+    key_file: examples/eab_handler/kid_profiles.json
+
+    [DBhandler]
+    # Banco SQLite persistido no PVC
+    dbfile: /home/ca/CA/acme.sqlite3
+
+    [Certificate]
+    revocation_reason_check_disable: False
+
+    [Challenge]
+    # Desabilitar APENAS para teste/debug — NÃO usar em produção
+    challenge_validation_disable: False
+
+    [Order]
+    tnauthlist_support: False
+    header_info_list: ["HTTP_USER_AGENT"]
+
+    [Renewalinfo]
+    renewaltreshold_pctg: 90
+
+  # ---------------------------------------------------------------------------
+  # kid_profiles.json — Chaves EAB para autenticação dos Security Servers
+  #
+  # keyid_1  → acesso genérico (sem perfil)
+  # keyid_2  → perfil auth (certificado de autenticação X-Road)
+  # keyid_3  → perfil sign (certificado de assinatura X-Road)
+  #
+  # ⚠️  PRODUÇÃO: gere HMACs novos com: openssl rand -hex 32
+  #     e atualize o local.yaml de cada Security Server correspondente
+  # ---------------------------------------------------------------------------
+  kid_profiles.json: |
+    {
+      "keyid_1": {
+        "hmac": "78a6d08bb1d1b91ab116790e1ab59517352fa5e0c8ac360c3a80255d80de2259"
+      },
+      "keyid_2": {
+        "hmac": "addfdbb19965e85623c124a88d085eae50a7f7f4f570989e3a320a81c3119625",
+        "cahandler": {
+          "profile_id": "auth"
+        }
+      },
+      "keyid_3": {
+        "hmac": "96d7380f5ea8de06912a4520d0adca616848b5e70cb3d0bd748af5b33507ddde",
+        "cahandler": {
+          "profile_id": "sign"
+        }
+      }
+    }

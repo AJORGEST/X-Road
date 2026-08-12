@@ -1,0 +1,36 @@
+# =============================================================================
+# pvc.yaml — PersistentVolumeClaim para estado da CA
+#
+# Monta em: /home/ca/CA/ dentro do container
+# Persiste: index.txt, serial, newcerts/, certs/, crl/, private/, CA.cnf,
+#           acme.sqlite3 (banco do acme2certifier)
+#
+# Tamanho: 1Gi é suficiente para centenas de milhares de certificados
+#
+# storageClassName:
+#   - "" (vazio)     → usa o default do cluster
+#   - "gp2"          → AWS EKS com EBS gp2
+#   - "gp3"          → AWS EKS com EBS gp3 (recomendado — melhor custo/perf)
+#   - "efs-sc"       → AWS EKS com EFS (multi-AZ, necessário se usar mais de 1 réplica)
+#   - "standard"     → Minikube / kind
+#
+# ⚠️  Com 1 réplica (deployment.yaml) → gp3 é suficiente (ReadWriteOnce)
+#     Com N réplicas → usar EFS (ReadWriteMany) — mas testca-dev não foi
+#     projetado para HA (index.txt é um arquivo sequencial)
+# =============================================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: testca-ca-data
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Descomente e ajuste conforme seu cluster:
+  # storageClassName: gp3

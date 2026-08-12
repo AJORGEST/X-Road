@@ -1,0 +1,245 @@
+# =============================================================================
+# deployment.yaml — Deployment do testca-dev (ACME / OCSP / TSA)
+#
+# Arquitetura interna do container (supervisord):
+#   - nginx            → reverse proxy interno
+#   - acme2certifier   → :8887  (ACME RFC 8555, uwsgi em /var/www/acme2certifier)
+#   - ca.py            → :8888  (CA manual / OCSP)
+#   - tsa_server       → :8899  (TSA RFC 3161)
+#
+# Volumes:
+#   - testca-ca-data (PVC)      → /home/ca/CA/  (estado persistente da CA)
+#   - testca-config (ConfigMap) → montado com subPath sobre os arquivos específicos
+#
+# Montagem do ConfigMap com subPath:
+#   Sobrescreve apenas os 2 arquivos necessários sem tocar no restante de
+#   /var/www/acme2certifier (módulos Python, uwsgi, etc).
+#
+# initContainer (init-ca-data):
+#   Monta o PVC em /mnt/ca-data (path neutro, sem sobrescrever /home/ca/CA da imagem).
+#   No primeiro boot (PVC vazio): copia os dados da CA da imagem para o PVC.
+#   Nos boots seguintes: PVC já tem os dados, apenas aplica FIXes idempotentes.
+#
+#   Por que copiar da imagem para o PVC?
+#     O Dockerfile.local roda init.sh em build-time, gerando os certificados com
+#     o CN correto (CA_NAME). O PVC garante que index.txt, serial e acme.sqlite3
+#     persistem entre restarts sem refazer o init.
+#
+# ⚠️  image: Substituir pelo registry/tag real gerado pelo build.sh
+#     ex: 644266601430.dkr.ecr.sa-east-1.amazonaws.com/maringa-dev:1.0.0
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: testca
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: ca-server
+    app.kubernetes.io/version: "1.0.0"
+spec:
+  # ⚠️  Manter 1 réplica: o index.txt é um arquivo sequencial não concorrente
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: testca
+  # Recreate garante que o volume não fique em uso por dois pods ao mesmo tempo
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: testca
+        app.kubernetes.io/component: ca-server
+    spec:
+      # ---------------------------------------------------------------------------
+      # initContainer: popula o PVC com os dados da CA (apenas no primeiro boot)
+      # ---------------------------------------------------------------------------
+      initContainers:
+        - name: init-ca-data
+          # Mesma imagem do container principal — contém certs gerados em build-time
+          image: testca-dev:latest          # ← substituir pelo seu registry/tag
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              # O PVC está montado em /mnt/ca-data (não em /home/ca/CA),
+              # então /home/ca/CA contém os dados originais da imagem.
+
+              echo "[init] Verificando PVC em /mnt/ca-data..."
+
+              if [ -f /mnt/ca-data/certs/ca.cert.pem ]; then
+                echo "[init] CA já inicializada no PVC — verificando FIXes..."
+
+                # FIX 2: serial do TSA (idempotente)
+                mkdir -p /home/ca/TSA
+                [ ! -f /home/ca/TSA/serial ] && echo "01" > /home/ca/TSA/serial
+
+                # FIX 3: permissão de escrita para www-data (uWSGI/acme2certifier)
+                # Sem isso, acme2certifier não consegue criar o acme.sqlite3 no PVC.
+                chown root:www-data /mnt/ca-data
+                chmod 775 /mnt/ca-data
+
+                echo "[init] PVC ok."
+                exit 0
+              fi
+
+              echo "[init] Primeiro boot — copiando CA da imagem para o PVC..."
+
+              # Copia todos os arquivos de /home/ca/CA (imagem) para /mnt/ca-data (PVC)
+              cp -a /home/ca/CA/. /mnt/ca-data/
+              echo "[init] Arquivos copiados da imagem para o PVC."
+
+              # Garantir permissões corretas no PVC
+              chmod 700  /mnt/ca-data/private
+              chmod 600  /mnt/ca-data/private/ca.key.pem
+              chmod 600  /mnt/ca-data/private/ocsp.key.pem
+              chmod 600  /mnt/ca-data/private/tsa.key.pem
+              chmod 664  /mnt/ca-data/index.txt
+              chmod 664  /mnt/ca-data/serial
+              chmod 0774 /mnt/ca-data/newcerts
+
+              # FIX 3: permissão de escrita para www-data (uWSGI/acme2certifier)
+              # Sem isso, acme2certifier não consegue criar o acme.sqlite3 no PVC.
+              chown root:www-data /mnt/ca-data
+              chmod 775 /mnt/ca-data
+              echo "[init] Permissões ajustadas."
+
+              # ---------------------------------------------------------------
+              # FIX 1: Adicionar CA cert ao index.txt
+              # O init.sh usa 'openssl req -x509' (self-signed), que não passa
+              # pelo 'openssl ca', então não é registrado no index.txt.
+              # Sem isso, OCSP retorna "unknown" para a própria CA e o X-Road
+              # falha com "OCSP Response was null".
+              # ---------------------------------------------------------------
+              echo "[init] FIX 1: verificando CA cert no index.txt..."
+              CA_SERIAL=$(openssl x509 -in /mnt/ca-data/certs/ca.cert.pem -serial -noout | cut -d= -f2)
+              if ! grep -q "$CA_SERIAL" /mnt/ca-data/index.txt 2>/dev/null; then
+                EXPIRY=$(openssl x509 -in /mnt/ca-data/certs/ca.cert.pem -enddate -noout \
+                  | sed 's/notAfter=//' \
+                  | xargs -I{} date -d "{}" +%y%m%d%H%M%SZ 2>/dev/null \
+                  || echo "460711213400Z")
+                CA_SUBJECT=$(openssl x509 -in /mnt/ca-data/certs/ca.cert.pem -subject -noout \
+                  | sed 's/subject=//' | sed 's/ //g')
+                printf "V\t%s\t\t%s\tunknown\t%s\n" "$EXPIRY" "$CA_SERIAL" "$CA_SUBJECT" \
+                  >> /mnt/ca-data/index.txt
+                echo "[init] FIX 1 aplicado. Serial CA: $CA_SERIAL"
+              else
+                echo "[init] FIX 1 já aplicado."
+              fi
+
+              # ---------------------------------------------------------------
+              # FIX 2: Criar serial do TSA
+              # Sem este arquivo, tsa_server.py pode falhar em uso concorrente.
+              # ---------------------------------------------------------------
+              mkdir -p /home/ca/TSA
+              [ ! -f /home/ca/TSA/serial ] && echo "01" > /home/ca/TSA/serial
+              echo "[init] FIX 2: TSA serial ok."
+
+              echo "[init] Inicialização concluída."
+              openssl x509 -in /mnt/ca-data/certs/ca.cert.pem -subject -noout
+
+          volumeMounts:
+            # PVC montado em path neutro para não sobrescrever /home/ca/CA da imagem
+            - name: ca-data
+              mountPath: /mnt/ca-data
+
+      # ---------------------------------------------------------------------------
+      # Container principal
+      # ---------------------------------------------------------------------------
+      containers:
+        - name: testca
+          image: testca-dev:latest          # ← substituir pelo seu registry/tag
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: acme
+              containerPort: 8887
+              protocol: TCP
+            - name: ocsp
+              containerPort: 8888
+              protocol: TCP
+            - name: tsa
+              containerPort: 8899
+              protocol: TCP
+
+          volumeMounts:
+            # PVC com estado persistente da CA
+            - name: ca-data
+              mountPath: /home/ca/CA
+
+            # ConfigMap: sobrescreve apenas os 2 arquivos via subPath
+            # Não interfere nos outros arquivos de /var/www/acme2certifier
+            - name: ca-config
+              mountPath: /var/www/acme2certifier/acme_srv/acme_srv.cfg
+              subPath: acme_srv.cfg
+              readOnly: true
+            - name: ca-config
+              mountPath: /var/www/acme2certifier/examples/eab_handler/kid_profiles.json
+              subPath: kid_profiles.json
+              readOnly: true
+
+          # -----------------------------------------------------------------------
+          # Liveness probe: ACME directory respondendo
+          # -----------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              path: /acme/directory
+              port: 8887
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # -----------------------------------------------------------------------
+          # Readiness probe: container pronto para receber tráfego
+          # -----------------------------------------------------------------------
+          readinessProbe:
+            httpGet:
+              path: /acme/directory
+              port: 8887
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # -----------------------------------------------------------------------
+          # Startup probe: tempo extra para boot
+          # -----------------------------------------------------------------------
+          startupProbe:
+            httpGet:
+              path: /acme/directory
+              port: 8887
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 18    # 18 * 10s = 3 minutos máximo para inicializar
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+
+          env:
+            - name: ENVIRONMENT
+              value: "dev"
+
+      # ---------------------------------------------------------------------------
+      # Volumes
+      # ---------------------------------------------------------------------------
+      volumes:
+        # Estado persistente da CA (index.txt, serial, certs, newcerts, crl, private)
+        - name: ca-data
+          persistentVolumeClaim:
+            claimName: testca-ca-data
+
+        # Configurações do acme2certifier (ConfigMap)
+        - name: ca-config
+          configMap:
+            name: testca-config

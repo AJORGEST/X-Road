@@ -1,0 +1,41 @@
+# =============================================================================
+# kustomization.yaml — Entry point para aplicar todos os manifests
+#
+# Uso:
+#   kubectl apply -k k8s-acme/
+#   kubectl delete -k k8s-acme/    # remover tudo
+#
+# Dry-run:
+#   kubectl apply -k k8s-acme/ --dry-run=client
+#
+# ⚠️  Antes de aplicar:
+#   1. Atualizar "newName" e "newTag" abaixo com o registry/tag gerado pelo build.sh
+#   2. Criar o Secret da chave da CA (ver secret.yaml)
+#   3. Criar os Secrets TLS (ver instruções no ingress.yaml)
+#   4. Domínios já configurados: *.dev.internal.maisdigital.maringa.pr.gov.br
+#   5. Ajustar storageClassName no pvc.yaml conforme seu cluster
+# =============================================================================
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: xvia-ss
+
+resources:
+  - pvc.yaml
+  - secret.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+# Substitui a tag da imagem sem editar o deployment.yaml
+# Atualizar com o registry/tag gerado pelo build.sh:
+images:
+  - name: testca-dev
+    newName: 644266601430.dkr.ecr.sa-east-1.amazonaws.com/maringa-dev
+    newTag: "1.0.0"
+
+# Labels comuns aplicados a todos os recursos
+commonLabels:
+  app.kubernetes.io/managed-by: kustomize
+  app.kubernetes.io/part-of: xroad

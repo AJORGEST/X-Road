@@ -1,0 +1,209 @@
+# CronJob de notificação de backup Velero via Google Chat
+# Roda às 07:00 America/Sao_Paulo — 4h após o backup diário (03:00 BRT)
+# Verifica o status do último backup de cada schedule e notifica via card
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: velero-notifier
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: velero-notifier
+    app.kubernetes.io/component: monitoring
+spec:
+  schedule: "0 7 * * *"   # 07:00 America/Sao_Paulo
+  timeZone: "America/Sao_Paulo"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 120
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: velero-notifier
+        spec:
+          serviceAccountName: velero-notifier
+          restartPolicy: OnFailure
+          containers:
+            - name: notifier
+              image: bitnami/kubectl:latest
+              env:
+                - name: WEBHOOK_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: velero-notifier-webhook
+                      key: WEBHOOK_URL
+                - name: CLUSTER_NAME
+                  value: "eksmaringa-prod"
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  #!/bin/sh
+                  # Velero Backup Notifier — Google Chat (Cards V2)
+
+                  echo "=== Velero Backup Notifier - $(date) ==="
+
+                  SCHEDULES=$(kubectl get schedules.velero.io -n velero -o jsonpath="{.items[*].metadata.name}" 2>/dev/null)
+
+                  if [ -z "$SCHEDULES" ]; then
+                    echo "ERRO: Nenhum schedule encontrado!"
+                    PAYLOAD=$(jq -n --arg cluster "$CLUSTER_NAME" '{cardsV2: [{cardId: "velero-alert", card: {header: {title: "⚠️ Velero — Sem Schedules", subtitle: $cluster}, sections: [{widgets: [{decoratedText: {text: "Nenhum schedule de backup encontrado."}}]}]}}]}')
+                    curl -s -X POST "${WEBHOOK_URL}" -H "Content-Type: application/json" -d "$PAYLOAD"
+                    exit 1
+                  fi
+
+                  echo "Schedules: $SCHEDULES"
+
+                  ALL_OK=true
+                  SECTIONS_JSON="[]"
+
+                  for SCHEDULE in $SCHEDULES; do
+                    echo ""
+                    echo "--- Schedule: $SCHEDULE ---"
+
+                    BACKUP_JSON=$(kubectl get backups.velero.io -n velero \
+                      -l velero.io/schedule-name=$SCHEDULE \
+                      --sort-by=.metadata.creationTimestamp \
+                      -o json 2>/dev/null)
+
+                    BACKUP_COUNT=$(echo "$BACKUP_JSON" | jq ".items | length")
+
+                    if [ "$BACKUP_COUNT" = "0" ] || [ -z "$BACKUP_COUNT" ]; then
+                      echo "  Aguardando primeiro backup"
+                      HEADER_TEXT="⏳ ${SCHEDULE}"
+                      SECTION=$(jq -n --arg header "$HEADER_TEXT" \
+                        '{header: $header, widgets: [{decoratedText: {topLabel: "Status", text: "Aguardando primeiro backup", bottomLabel: "Schedule sem execução ainda"}}]}')
+                      SECTIONS_JSON=$(echo "$SECTIONS_JSON" | jq --argjson sec "$SECTION" '. + [$sec]')
+                      continue
+                    fi
+
+                    LAST_BACKUP=$(echo "$BACKUP_JSON" | jq ".items[-1]")
+                    BACKUP_NAME=$(echo "$LAST_BACKUP" | jq -r '.metadata.name')
+                    PHASE=$(echo "$LAST_BACKUP" | jq -r '.status.phase // "Unknown"')
+                    STARTED=$(echo "$LAST_BACKUP" | jq -r '.status.startTimestamp // ""')
+                    COMPLETED_TS=$(echo "$LAST_BACKUP" | jq -r '.status.completionTimestamp // ""')
+                    EXPIRATION=$(echo "$LAST_BACKUP" | jq -r '.status.expiration // ""')
+                    ITEMS_BACKED=$(echo "$LAST_BACKUP" | jq -r '.status.progress.itemsBackedUp // 0')
+                    TOTAL_ITEMS=$(echo "$LAST_BACKUP" | jq -r '.status.progress.totalItems // 0')
+                    SNAPSHOTS_ATTEMPTED=$(echo "$LAST_BACKUP" | jq -r '.status.volumeSnapshotsAttempted // 0')
+                    SNAPSHOTS_COMPLETED=$(echo "$LAST_BACKUP" | jq -r '.status.volumeSnapshotsCompleted // 0')
+                    NAMESPACES=$(echo "$LAST_BACKUP" | jq -r '(.spec.includedNamespaces // []) | join(", ")')
+
+                    echo "  Backup: $BACKUP_NAME | Phase: $PHASE"
+                    echo "  Items: $ITEMS_BACKED/$TOTAL_ITEMS | Snaps: $SNAPSHOTS_COMPLETED/$SNAPSHOTS_ATTEMPTED"
+
+                    # Calcular duração
+                    DURATION="N/A"
+                    if [ -n "$STARTED" ] && [ "$STARTED" != "" ] && [ -n "$COMPLETED_TS" ] && [ "$COMPLETED_TS" != "" ]; then
+                      START_EPOCH=$(date -d "$STARTED" +%s 2>/dev/null || echo "")
+                      END_EPOCH=$(date -d "$COMPLETED_TS" +%s 2>/dev/null || echo "")
+                      if [ -n "$START_EPOCH" ] && [ -n "$END_EPOCH" ]; then
+                        DIFF=$((END_EPOCH - START_EPOCH))
+                        if [ $DIFF -ge 60 ]; then
+                          DURATION="$((DIFF / 60))m$((DIFF % 60))s"
+                        else
+                          DURATION="${DIFF}s"
+                        fi
+                      fi
+                    fi
+
+                    EXPIRY_SHORT=$(echo "$EXPIRATION" | cut -dT -f1)
+
+                    # Definir ícone/status conforme phase
+                    case "$PHASE" in
+                      Completed) ICON="✅"; STATUS_TEXT="Sucesso" ;;
+                      PartiallyFailed) ICON="⚠️"; STATUS_TEXT="Parcial"; ALL_OK=false ;;
+                      Failed) ICON="❌"; STATUS_TEXT="Falhou"; ALL_OK=false ;;
+                      InProgress) ICON="🔄"; STATUS_TEXT="Em andamento" ;;
+                      *) ICON="❓"; STATUS_TEXT="$PHASE"; ALL_OK=false ;;
+                    esac
+
+                    # Verificar se backup é de hoje
+                    TODAY=$(date -u +%Y-%m-%d)
+                    BACKUP_DATE=$(echo "$STARTED" | cut -dT -f1)
+                    if [ "$BACKUP_DATE" != "$TODAY" ] && [ "$PHASE" = "Completed" ]; then
+                      ICON="⚠️"; STATUS_TEXT="Desatualizado ($BACKUP_DATE)"; ALL_OK=false
+                    fi
+
+                    if [ -z "$NAMESPACES" ]; then NAMESPACES="todos (conforme schedule)"; fi
+
+                    echo "  → $ICON $STATUS_TEXT | Duração: $DURATION"
+
+                    # Construir section com jq (garante JSON válido)
+                    HEADER_TEXT="${ICON} ${SCHEDULE}"
+                    SECTION=$(jq -n \
+                      --arg header "$HEADER_TEXT" \
+                      --arg status "$STATUS_TEXT" \
+                      --arg backup_name "$BACKUP_NAME" \
+                      --arg items "${ITEMS_BACKED}/${TOTAL_ITEMS}" \
+                      --arg snapshots "${SNAPSHOTS_COMPLETED}/${SNAPSHOTS_ATTEMPTED}" \
+                      --arg duration "$DURATION" \
+                      --arg namespaces "$NAMESPACES" \
+                      --arg expiry "Expira: ${EXPIRY_SHORT:-N/A}" \
+                      '{
+                        header: $header,
+                        widgets: [
+                          {decoratedText: {topLabel: "Status", text: $status, bottomLabel: $backup_name}},
+                          {columns: {columnItems: [
+                            {horizontalSizeStyle: "FILL_AVAILABLE_SPACE", horizontalAlignment: "START", verticalAlignment: "CENTER",
+                             widgets: [{decoratedText: {topLabel: "Itens", text: $items}}]},
+                            {horizontalSizeStyle: "FILL_AVAILABLE_SPACE", horizontalAlignment: "START", verticalAlignment: "CENTER",
+                             widgets: [{decoratedText: {topLabel: "Snapshots", text: $snapshots}}]},
+                            {horizontalSizeStyle: "FILL_AVAILABLE_SPACE", horizontalAlignment: "START", verticalAlignment: "CENTER",
+                             widgets: [{decoratedText: {topLabel: "Duração", text: $duration}}]}
+                          ]}},
+                          {decoratedText: {topLabel: "Namespaces", text: $namespaces, bottomLabel: $expiry}}
+                        ]
+                      }')
+
+                    SECTIONS_JSON=$(echo "$SECTIONS_JSON" | jq --argjson sec "$SECTION" '. + [$sec]')
+                  done
+
+                  # Header do card
+                  if [ "$ALL_OK" = "true" ]; then
+                    TITLE="✅ Backups Velero — Todos OK"
+                  else
+                    TITLE="⚠️ Backups Velero — Atenção Necessária"
+                  fi
+                  NOW_DATE=$(date -u +%d/%m/%Y)
+                  NOW_TIME=$(date -u +%H:%M)
+                  SUBTITLE="${CLUSTER_NAME} - ${NOW_DATE} ${NOW_TIME} UTC"
+
+                  # Montar payload final com jq
+                  PAYLOAD=$(jq -n \
+                    --arg title "$TITLE" \
+                    --arg subtitle "$SUBTITLE" \
+                    --argjson sections "$SECTIONS_JSON" \
+                    '{cardsV2: [{cardId: "velero-daily-report", card: {header: {title: $title, subtitle: $subtitle, imageUrl: "https://velero.io/img/Velero.svg", imageType: "CIRCLE"}, sections: $sections}}]}')
+
+                  echo ""
+                  echo "=== Enviando notificação para Google Chat ==="
+
+                  HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+                    -X POST "${WEBHOOK_URL}" \
+                    -H "Content-Type: application/json" \
+                    -d "$PAYLOAD")
+
+                  if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                    echo "✅ Notificação enviada com sucesso (HTTP $HTTP_CODE)"
+                  else
+                    echo "❌ Falha ao enviar (HTTP $HTTP_CODE)"
+                    cat /tmp/response.txt 2>/dev/null
+                    echo ""
+                    echo "Payload:"
+                    echo "$PAYLOAD" | jq . 2>/dev/null || echo "$PAYLOAD"
+                    exit 1
+                  fi
+
+                  echo "=== Concluído ==="
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi

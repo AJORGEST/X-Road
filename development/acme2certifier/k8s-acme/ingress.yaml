@@ -1,0 +1,126 @@
+# =============================================================================
+# ingress.yaml — IngressRoutes Traefik CRD para ACME / OCSP / TSA
+#
+# O Traefik neste cluster usa apenas providers.kubernetescrd (não processa
+# Ingress padrão do Kubernetes). Por isso usamos IngressRoute (CRD nativo).
+#
+# TLS: Certificados self-signed gerados manualmente (domínios internos não
+# suportam Let's Encrypt HTTP-01). Os Secrets TLS devem ser criados
+# previamente — ver seção "Criar TLS Secrets" abaixo.
+#
+# DNS (wildcard já existente no Route53):
+#   *.dev.internal.maisdigital.maringa.pr.gov.br
+#     → NLB interno do Traefik
+#
+# Hostnames:
+#   ACME:    https://acme.dev.internal.maisdigital.maringa.pr.gov.br/
+#            (directory em / ou /directory)
+#   OCSP:    https://ocsp.dev.internal.maisdigital.maringa.pr.gov.br/
+#            (POST OCSP request em /, interface /testca/, certs em /testca/certs/)
+#   TSA:     https://tsa.dev.internal.maisdigital.maringa.pr.gov.br/
+#            (POST timestamp-query em /)
+#
+# Registrar no Central Server X-Road:
+#   ACME Directory URL: https://acme.dev.internal.maisdigital.maringa.pr.gov.br/directory
+#   OCSP URL:           https://ocsp.dev.internal.maisdigital.maringa.pr.gov.br/
+#   TSA URL:            https://tsa.dev.internal.maisdigital.maringa.pr.gov.br/
+#
+# ---------------------------------------------------------------------------
+# Criar TLS Secrets (executar uma vez antes do deploy):
+#
+#   # Gerar CA raiz
+#   openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+#     -keyout /tmp/ca.key -out /tmp/ca.crt -days 3650 \
+#     -subj "/CN=Internal Dev CA/O=Maringa Dev"
+#
+#   # Para cada domínio (acme, ocsp, tsa):
+#   openssl req -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+#     -keyout /tmp/<name>.key -out /tmp/<name>.csr \
+#     -subj "/CN=<host>"
+#   openssl x509 -req -in /tmp/<name>.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key \
+#     -CAcreateserial -out /tmp/<name>.crt -days 365 \
+#     -extfile <(echo "subjectAltName=DNS:<host>")
+#
+#   kubectl create secret tls testca-acme-tls -n xvia-ss \
+#     --cert=/tmp/acme.crt --key=/tmp/acme.key
+#   kubectl create secret tls testca-ocsp-tls -n xvia-ss \
+#     --cert=/tmp/ocsp.crt --key=/tmp/ocsp.key
+#   kubectl create secret tls testca-tsa-tls -n xvia-ss \
+#     --cert=/tmp/tsa.crt --key=/tmp/tsa.key
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# ACME — acme2certifier escuta em :8887
+# Directory URL: /directory ou /
+# ---------------------------------------------------------------------------
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: testca-acme-route
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: ingress-acme
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`acme.dev.internal.maisdigital.maringa.pr.gov.br`)
+      kind: Rule
+      services:
+        - name: testca
+          port: 8887
+  tls:
+    secretName: testca-acme-tls
+
+---
+# ---------------------------------------------------------------------------
+# OCSP + CA manual — nginx escuta em :8888
+#   /              → OCSP Responder (POST application/ocsp-request)
+#   /testca/       → Interface web de assinatura de CSR (sign/auth)
+#   /testca/certs/ → Download de certificados da CA (ca.cert.pem, etc)
+# ---------------------------------------------------------------------------
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: testca-ocsp-route
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: ingress-ocsp
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`ocsp.dev.internal.maisdigital.maringa.pr.gov.br`)
+      kind: Rule
+      services:
+        - name: testca
+          port: 8888
+  tls:
+    secretName: testca-ocsp-tls
+
+---
+# ---------------------------------------------------------------------------
+# TSA — tsa_server.py escuta em :8899
+# POST / com binário application/timestamp-query (RFC 3161)
+# ---------------------------------------------------------------------------
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: testca-tsa-route
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: ingress-tsa
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`tsa.dev.internal.maisdigital.maringa.pr.gov.br`)
+      kind: Rule
+      services:
+        - name: testca
+          port: 8899
+  tls:
+    secretName: testca-tsa-tls

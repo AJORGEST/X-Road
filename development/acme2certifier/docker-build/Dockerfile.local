@@ -1,0 +1,168 @@
+# =============================================================================
+# Dockerfile.local — testca-dev sem dependência de mirror privado
+#
+# Diferenças do Dockerfile original:
+#   - Sem --mount=type=bind,from=mirror-scripts (mirror privado removido)
+#   - ARGs para personalizar nome da CA sem editar init.sh manualmente
+#   - acme_srv.cfg já com eab_profiling: False (compatível com X-Road 7.8)
+#   - init.sh copiado do source original e ajustado em build time
+#
+# Build básico:
+#   docker build -f Dockerfile.local -t minha-ca:1.0.0 .
+#
+# Build personalizado:
+#   docker build -f Dockerfile.local \
+#     --build-arg CA_NAME="Minha CA" \
+#     --build-arg CA_ORG="Minha Org" \
+#     -t minha-ca:1.0.0 .
+#
+# Ou usando o script interativo:
+#   bash build.sh
+# =============================================================================
+FROM ubuntu:24.04
+
+# ---------------------------------------------------------------------------
+# ARGs de personalização — altere aqui ou passe via --build-arg no build.sh
+# ---------------------------------------------------------------------------
+ARG CA_NAME="Test CA"
+ARG CA_ORG="Test"
+ARG OCSP_NAME="Test OCSP"
+ARG TSA_NAME="Test TSA"
+ARG A2C_VER=0.35
+
+# Expor como ENV para uso no entrypoint se necessário
+ENV CA_NAME=${CA_NAME}
+ENV CA_ORG=${CA_ORG}
+
+# ---------------------------------------------------------------------------
+# Dependências do sistema
+# ---------------------------------------------------------------------------
+ADD https://github.com/grindsa/acme2certifier/releases/download/${A2C_VER}/acme2certifier_${A2C_VER}-1_all.deb /tmp/
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates supervisor nginx python3 python3-pip \
+    uwsgi uwsgi-plugin-python3 curl nano \
+  && apt -y install --no-install-recommends /tmp/acme2certifier_${A2C_VER}-1_all.deb \
+  && rm -f /tmp/acme2certifier_*.deb \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Usuários: ca (dona da CA), ocsp (roda o OCSP responder)
+# ---------------------------------------------------------------------------
+RUN useradd -m ca -U \
+  && useradd -G ca ocsp
+
+# ---------------------------------------------------------------------------
+# Copiar arquivos da CA e configurações de sistema
+# (espelha a estrutura de files/ do testca-dev original)
+# ---------------------------------------------------------------------------
+COPY files/home /home
+COPY files/etc  /etc
+
+RUN chown -R ca:ca /home/ca/CA \
+  && find /home/ca/TSA -type f -exec chmod 0664 {} + \
+  && find /home/ca/CA  -type f -exec chmod 0740 {} + \
+  && mkdir -p /var/log/ \
+  && touch /var/log/ocsp.log \
+  && chown ca:ca /var/log/ocsp.log \
+  && chmod 0664 /var/log/ocsp.log \
+  && chmod 0774 /home/ca/CA/newcerts \
+  && chmod 0754 /home/ca/CA/ca.py \
+  && chmod 0754 /home/ca/CA/sign_req.sh \
+  && chmod 0664 /home/ca/CA/index.txt \
+  && chmod 0664 /home/ca/CA/serial
+
+# ---------------------------------------------------------------------------
+# Injetar nome da CA no init.sh via ARGs do build e REGENERAR certificados
+#
+# Por que rodar init.sh no build-time e não no boot?
+#   - files/home/ca/CA/ pode conter .init + certs pré-existentes copiados do
+#     testca-dev original (com CN=Test CA). Se não limpamos aqui, o init.sh
+#     não roda no boot (guarda-chuva do `if [ -f .init ]`) e o nome errado
+#     permanece.
+#   - Rodando no build garantimos que os certificados na imagem já têm o
+#     CN correto, independentemente do estado do volume no host.
+# ---------------------------------------------------------------------------
+RUN sed -i "s|^DN_CA_O=.*|DN_CA_O=\"${CA_ORG}\"|"       /home/ca/CA/init.sh \
+  && sed -i "s|^DN_CA_CN=.*|DN_CA_CN=\"${CA_NAME}\"|"    /home/ca/CA/init.sh \
+  && sed -i "s|^DN_OCSP_O=.*|DN_OCSP_O=\"${CA_ORG}\"|"   /home/ca/CA/init.sh \
+  && sed -i "s|^DN_OCSP_CN=.*|DN_OCSP_CN=\"${OCSP_NAME}\"|" /home/ca/CA/init.sh \
+  && sed -i "s|^DN_TSA_O=.*|DN_TSA_O=\"${CA_ORG}\"|"     /home/ca/CA/init.sh \
+  && sed -i "s|^DN_TSA_CN=.*|DN_TSA_CN=\"${TSA_NAME}\"|"  /home/ca/CA/init.sh
+
+# Verificar que os nomes foram aplicados (visível no docker build output)
+RUN echo "=== Nomes da CA configurados ===" \
+  && grep -E "^DN_(CA|OCSP|TSA)_(O|CN)=" /home/ca/CA/init.sh
+
+# Remover certificados pré-existentes (do testca-dev original com CN=Test CA)
+# e o marcador .init, depois regenerar tudo com os novos nomes
+RUN rm -f /home/ca/CA/.init \
+  && cd /home/ca/CA \
+  && bash init.sh \
+  && echo "=== Certificado CA gerado ===" \
+  && openssl x509 -in /home/ca/CA/certs/ca.cert.pem -subject -noout
+
+# ---------------------------------------------------------------------------
+# Configurar acme2certifier + nginx
+# (idêntico ao Dockerfile original, sem o mirror)
+# ---------------------------------------------------------------------------
+RUN sed -i "s/run\/uwsgi\/acme.sock/var\/www\/acme2certifier\/acme.sock/g" \
+        /var/www/acme2certifier/examples/nginx/nginx_acme_srv.conf \
+  && sed -i "s/80/8887/g" \
+        /var/www/acme2certifier/examples/nginx/nginx_acme_srv.conf \
+  && cp  /var/www/acme2certifier/examples/nginx/nginx_acme_srv.conf \
+         /etc/nginx/sites-available/acme_srv.conf \
+  && ln -s /etc/nginx/sites-available/acme_srv.conf \
+           /etc/nginx/sites-enabled/acme_srv.conf \
+  && sed -i "s/\/run\/uwsgi\/acme.sock/acme.sock/g" \
+        /var/www/acme2certifier/examples/nginx/acme2certifier.ini \
+  && sed -i "s/nginx/www-data/g" \
+        /var/www/acme2certifier/examples/nginx/acme2certifier.ini \
+  && echo "plugins = python3" \
+        >> /var/www/acme2certifier/examples/nginx/acme2certifier.ini \
+  && cp  /var/www/acme2certifier/examples/nginx/acme2certifier.ini \
+         /var/www/acme2certifier \
+  && sed -i "s/level=log_mode)/level=log_mode,filename='logs\/a2c_logs')/g" \
+        /var/www/acme2certifier/acme_srv/helper.py \
+  && mkdir -p /var/www/acme2certifier/logs \
+  && chown -R www-data:www-data /var/www/acme2certifier/logs \
+  && sed -i "4i import base64" \
+        /var/www/acme2certifier/acme_srv/renewalinfo.py \
+  && sed -i "s/b64_decode(self.logger, /base64.b64decode(/g" \
+        /var/www/acme2certifier/acme_srv/renewalinfo.py \
+  && usermod -a -G ca www-data
+
+# ---------------------------------------------------------------------------
+# Copiar configurações personalizadas do ACME
+# acme_srv.cfg já vem com eab_profiling: False (corrigido para X-Road 7.8)
+# kid_profiles.json com os perfis auth/sign para o X-Road
+# ---------------------------------------------------------------------------
+COPY --chown=www-data:www-data files/acme2certifier/acme_srv.cfg \
+     /var/www/acme2certifier/acme_srv/acme_srv.cfg
+
+COPY --chown=www-data:www-data files/acme2certifier/kid_profiles.json \
+     /var/www/acme2certifier/examples/eab_handler/kid_profiles.json
+
+COPY --chown=www-data:www-data files/acme2certifier/openssl_ca_handler.py \
+     /var/www/acme2certifier/examples/ca_handler/openssl_ca_handler.py
+
+# ---------------------------------------------------------------------------
+# Entrypoint e supervisor
+# ---------------------------------------------------------------------------
+COPY files/ca-entrypoint.sh /root/entrypoint.sh
+RUN chmod +x /root/entrypoint.sh
+
+COPY --chown=root:root files/ca-xroad.conf /etc/supervisor/conf.d/xroad.conf
+
+# ---------------------------------------------------------------------------
+# Portas expostas pelo container
+#   8887 → ACME (acme2certifier via uwsgi + nginx)
+#   8888 → OCSP + CA manual (ca.py via nginx)
+#   8899 → TSA (tsa_server.py)
+# ---------------------------------------------------------------------------
+EXPOSE 8887 8888 8899
+
+CMD ["/root/entrypoint.sh"]

@@ -1,0 +1,10 @@
+# Chaves privadas
+docker-build/files/home/ca/CA/private/
+k8s-acme/ca.key.pem
+
+# Secrets do Kubernetes
+k8s-acme/secret.yaml
+k8s-acme/velero/velero-notifier/secret.yaml
+
+# Variáveis locais (contém IDs de conta AWS, etc)
+docker-build/.env

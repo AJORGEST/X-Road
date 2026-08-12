@@ -1,0 +1,41 @@
+# =============================================================================
+# service.yaml — ClusterIP para o testca-dev
+#
+# Expõe as 3 portas internas do container para o Ingress Controller:
+#   - 8887 → ACME (acme2certifier)
+#   - 8888 → OCSP + CA manual (ca.py)
+#   - 8899 → TSA (tsa_server.py)
+#
+# Tipo ClusterIP: acessível apenas dentro do cluster.
+# O Ingress (ingress.yaml) faz a exposição externa com TLS.
+#
+# Por que um único Service?
+#   O container expõe 3 portas mas roda em 1 Pod.
+#   Um único ClusterIP com 3 ports é suficiente.
+#   O Ingress roteia para a porta certa de cada serviço.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: testca
+  namespace: xvia-ss
+  labels:
+    app.kubernetes.io/name: testca
+    app.kubernetes.io/component: ca-server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: testca
+  ports:
+    - name: acme
+      port: 8887
+      targetPort: 8887
+      protocol: TCP
+    - name: ocsp
+      port: 8888
+      targetPort: 8888
+      protocol: TCP
+    - name: tsa
+      port: 8899
+      targetPort: 8899
+      protocol: TCP

@@ -1,0 +1,15 @@
+# Kustomization para deploy do Velero Notifier
+# Uso: kubectl apply -k velero-notifier/
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: velero
+
+resources:
+  - rbac.yaml
+  - secret.yaml
+  - cronjob.yaml
+
+commonLabels:
+  app.kubernetes.io/part-of: velero
+  app.kubernetes.io/managed-by: kustomize
