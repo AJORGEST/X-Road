@@ -1,17 +1,17 @@
 # O fluxo correto antes de fazer o deploy:
 
-  # 1. Copiar a chave do container Docker existente:
+  ### 1. Copiar a chave do container Docker existente:
   docker cp testca:/home/ca/CA/private/ca.key.pem ./ca.key.pem
 
-  # 2. Criar o Secret diretamente no cluster (sem passar pelo arquivo/Git):
+  ### 2. Criar o Secret diretamente no cluster (sem passar pelo arquivo/Git):
   kubectl create secret generic testca-ca-key \
     --from-file=ca.key.pem=./ca.key.pem \
     --namespace=testca
 
-  # 3. Apagar o arquivo local:
+  ### 3. Apagar o arquivo local:
   rm -f ./ca.key.pem
 
-# k8s-acme — Manifests Kubernetes para testca-dev (ACME / OCSP / TSA)
+### k8s-acme — Manifests Kubernetes para testca-dev (ACME / OCSP / TSA)
 
 Deploy do container `testca-dev` em Kubernetes com suporte ao X-Road via ACME (RFC 8555), OCSP e TSA.
 
